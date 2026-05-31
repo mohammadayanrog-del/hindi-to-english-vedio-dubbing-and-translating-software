@@ -1,0 +1,150 @@
+# ============================================================
+# CELL 8 — Sync TTS Audio to SRT Timing
+# ============================================================
+from pydub import AudioSegment
+import librosa
+import numpy as np
+import os, json
+
+TARGET_FRAME_RATE   = 24000   # F5-TTS native rate — do not change
+TARGET_SAMPLE_WIDTH = 2
+
+
+def parse_time(time_str):
+    parts    = time_str.replace(',', '.').split('.')
+    hms_part = parts[0]
+    ms_part  = (parts[1] if len(parts) > 1 else '0').ljust(3, '0')[:3]
+    h, m, s  = hms_part.split(':')
+    return (int(h) * 3600 + int(m) * 60 + int(s)) * 1000 + int(ms_part)
+
+
+def parse_srt(srt_path):
+    entries = []
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        lines = [l.strip() for l in f.readlines()]
+    i = 0
+    while i < len(lines):
+        if not lines[i]:
+            i += 1; continue
+        try:
+            int(lines[i])
+        except ValueError:
+            i += 1; continue
+        i += 1
+        if i >= len(lines) or ' --> ' not in lines[i]:
+            continue
+        start_str, end_str = lines[i].split(' --> ')
+        start = parse_time(start_str.strip())
+        end   = parse_time(end_str.strip())
+        if start >= end:
+            end = start + 100
+        i += 1
+        while i < len(lines) and lines[i]:
+            i += 1
+        entries.append({'start': start, 'end': end, 'duration': end - start})
+        i += 1
+    return entries
+
+
+def load_audio(path):
+    audio = AudioSegment.from_wav(path)
+    if audio.frame_rate != TARGET_FRAME_RATE:
+        audio = audio.set_frame_rate(TARGET_FRAME_RATE)
+    if audio.channels > 1:
+        audio = audio.set_channels(1)
+    return audio
+
+
+def time_stretch_safe(audio_segment, ratio):
+    """Only stretch within ±10% to avoid robotic artifacts."""
+    if not (0.9 <= ratio <= 1.1):
+        return None  # caller handles pad/trim
+    samples   = np.array(audio_segment.get_array_of_samples()).astype(np.float32) / 32767.0
+    stretched = librosa.effects.time_stretch(samples, rate=ratio)
+    stretched = np.clip(stretched * 32767, -32767, 32767).astype(np.int16)
+    return AudioSegment(
+        stretched.tobytes(),
+        frame_rate=TARGET_FRAME_RATE,
+        sample_width=TARGET_SAMPLE_WIDTH,
+        channels=1
+    )
+
+
+def sync_audio_to_srt(tts_dir, srt_path, output_path, segment_data_path):
+    with open(segment_data_path, 'r') as f:
+        segment_data = json.load(f)
+
+    srt_entries = parse_srt(srt_path)
+    print(f'   SRT entries : {len(srt_entries)}')
+    print(f'   Segments    : {len(segment_data)}')
+
+    total_duration_ms = srt_entries[-1]['end'] + 1000
+    final_audio = AudioSegment.silent(duration=total_duration_ms, frame_rate=TARGET_FRAME_RATE)
+
+    placed  = 0
+    skipped = 0
+
+    for seg, srt_entry in zip(segment_data, srt_entries):
+        tts_path = os.path.join(tts_dir, f"tts_{seg['index']:04d}.wav")
+
+        if not os.path.exists(tts_path):
+            print(f'  ⚠️  Missing : tts_{seg["index"]:04d}.wav')
+            skipped += 1
+            continue
+
+        tts_audio = load_audio(tts_path)
+
+        if tts_audio.rms < 50:
+            print(f'  ⚠️  Seg {seg["index"]} silent — skipping')
+            skipped += 1
+            continue
+
+        srt_duration = srt_entry['duration']
+        tts_duration = len(tts_audio)
+        position_ms  = srt_entry['start']
+
+        if tts_duration != srt_duration:
+            ratio     = tts_duration / srt_duration
+            stretched = time_stretch_safe(tts_audio, ratio)
+
+            if stretched is not None:
+                tts_audio = stretched
+            elif tts_duration < srt_duration:
+                # Pad with silence — better than over-stretching
+                tts_audio += AudioSegment.silent(
+                    srt_duration - tts_duration,
+                    frame_rate=TARGET_FRAME_RATE
+                )
+            else:
+                # Trim — better than over-compressing
+                tts_audio = tts_audio[:srt_duration]
+
+        # Overlay at correct SRT timestamp
+        final_audio = final_audio.overlay(tts_audio, position=position_ms)
+        placed += 1
+
+    print(f'   ✅ Placed  : {placed}')
+    print(f'   ⚠️  Skipped : {skipped}')
+
+    final_audio.export(
+        output_path, format='wav',
+        parameters=['-ar', str(TARGET_FRAME_RATE)]
+    )
+    print(f'✅ Synced audio: {output_path} ({len(final_audio)/1000:.1f}s)')
+    return final_audio
+
+
+# ---- Run ----
+SYNCED_AUDIO_PATH = '/content/pipeline/synced_english_audio.wav'
+ENGLISH_SRT_PATH  = '/content/pipeline/subtitles_english.srt'
+SEGMENT_DATA_PATH = '/content/pipeline/segment_data.json'
+
+print('⏱️  Synchronizing TTS audio to SRT timing...')
+final = sync_audio_to_srt(TTS_DIR, ENGLISH_SRT_PATH, SYNCED_AUDIO_PATH, SEGMENT_DATA_PATH)
+
+rms = final.rms
+print(f'\n   Audio RMS : {rms}')
+if rms < 50:
+    print('   ❌ Silent — check TTS files')
+else:
+    print('   ✅ Audio OK — proceed to Cell 9')
