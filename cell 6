@@ -1,0 +1,179 @@
+# ============================================================
+# CELL 6 — Voice Cloning Source Selection (4 Options)
+# ============================================================
+import os, json, subprocess
+from google.colab import files
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
+from pydub import AudioSegment
+import yt_dlp
+
+with open('/content/pipeline/segment_data.json', 'r') as f:
+    segment_data = json.load(f)
+NUM_SPEAKERS = max(s['speaker'] for s in segment_data)
+
+REF_VOICES_DIR = '/content/pipeline/reference_voices'
+CHUNKS_DIR     = '/content/pipeline/audio_chunks'
+
+# Will be populated after selection: {speaker_id: wav_path}
+REFERENCE_VOICES = {}
+
+def extract_best_chunk_for_speaker(speaker_id, min_dur=3.0, max_dur=15.0):
+    """Find the longest clean audio chunk for a given speaker."""
+    segs = [s for s in segment_data if s['speaker'] == speaker_id]
+    segs_sorted = sorted(segs, key=lambda x: x['duration'], reverse=True)
+    for seg in segs_sorted:
+        if seg['duration'] >= min_dur:
+            chunk_path = os.path.join(CHUNKS_DIR, f"chunk_{seg['index']:04d}.wav")
+            if os.path.exists(chunk_path):
+                # Trim to max_dur seconds for reference
+                audio = AudioSegment.from_wav(chunk_path)
+                trimmed = audio[:int(max_dur * 1000)]
+                out = os.path.join(REF_VOICES_DIR, f'ref_speaker_{speaker_id}_auto.wav')
+                trimmed.export(out, format='wav')
+                return out
+    # Fallback: concatenate multiple short chunks
+    combined = AudioSegment.empty()
+    for seg in segs_sorted[:5]:
+        chunk_path = os.path.join(CHUNKS_DIR, f"chunk_{seg['index']:04d}.wav")
+        if os.path.exists(chunk_path):
+            combined += AudioSegment.from_wav(chunk_path)
+        if len(combined) >= min_dur * 1000:
+            break
+    out = os.path.join(REF_VOICES_DIR, f'ref_speaker_{speaker_id}_auto.wav')
+    combined[:int(max_dur * 1000)].export(out, format='wav')
+    return out
+
+# ----- UI -----
+display(HTML('<h3>🎙️ Step 2: Choose Voice Cloning Option</h3>'))
+
+voice_option = widgets.RadioButtons(
+    options=[
+        '1️⃣  Use original video audio (auto-extract best voice per speaker)',
+        '2️⃣  Use a different video URL (first speaker → speaker 1, etc.)',
+        '3️⃣  Record your own voice for each speaker',
+        '4️⃣  Upload audio file for each speaker'
+    ],
+    layout=widgets.Layout(width='700px')
+)
+
+# Option 2 — URL input
+ref_url_box = widgets.Text(
+    placeholder='https://www.youtube.com/watch?v=... (reference video)',
+    layout=widgets.Layout(width='600px', display='none')
+)
+
+# Option 3/4 — Per-speaker file upload bars
+speaker_upload_area = widgets.VBox([], layout=widgets.Layout(display='none'))
+
+confirm_btn = widgets.Button(description='✅ Confirm Voice Selection', button_style='success', icon='check')
+voice_status = widgets.Output()
+
+speaker_upload_widgets = {}  # {speaker_id: (label, button, output)}
+
+def build_speaker_upload_bars(mode='upload'):
+    bars = []
+    for spk in range(1, NUM_SPEAKERS + 1):
+        label = widgets.HTML(f'<b>Speaker {spk}</b> — {'🎤 Record (upload a recording file below)' if mode=="record" else "📁 Upload WAV/MP3"}')
+        btn   = widgets.Button(description=f'Upload file for Speaker {spk}', icon='upload')
+        out   = widgets.Output()
+        speaker_upload_widgets[spk] = (label, btn, out)
+
+        def make_upload_fn(spk_id, out_widget):
+            def do_upload(b):
+                with out_widget:
+                    clear_output()
+                    print(f'📁 Opening file picker for Speaker {spk_id}...')
+                    uploaded = files.upload()
+                    if uploaded:
+                        fname = list(uploaded.keys())[0]
+                        # Convert to WAV
+                        src = f'/tmp/{fname}'
+                        with open(src, 'wb') as f_:
+                            f_.write(uploaded[fname])
+                        dest = os.path.join(REF_VOICES_DIR, f'ref_speaker_{spk_id}_custom.wav')
+                        subprocess.run(['ffmpeg', '-y', '-i', src, '-ar', '44100', '-ac', '1', dest],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        REFERENCE_VOICES[spk_id] = dest
+                        print(f'✅ Speaker {spk_id} voice saved!')
+            return do_upload
+
+        btn.on_click(make_upload_fn(spk, out))
+        bars.append(widgets.VBox([label, btn, out]))
+    speaker_upload_area.children = bars
+
+def on_option_change(change):
+    opt = change['new']
+    ref_url_box.layout.display   = 'flex' if '2️⃣' in opt else 'none'
+    if '3️⃣' in opt:
+        build_speaker_upload_bars(mode='record')
+        speaker_upload_area.layout.display = 'flex'
+    elif '4️⃣' in opt:
+        build_speaker_upload_bars(mode='upload')
+        speaker_upload_area.layout.display = 'flex'
+    else:
+        speaker_upload_area.layout.display = 'none'
+
+voice_option.observe(on_option_change, names='value')
+
+def on_confirm(b):
+    global REFERENCE_VOICES
+    with voice_status:
+        clear_output()
+        opt = voice_option.value
+
+        if '1️⃣' in opt:
+            print(f'🔍 Extracting best voice clips from original video for {NUM_SPEAKERS} speaker(s)...')
+            for spk in range(1, NUM_SPEAKERS + 1):
+                path = extract_best_chunk_for_speaker(spk)
+                REFERENCE_VOICES[spk] = path
+                print(f'  ✅ Speaker {spk}: {path}')
+
+        elif '2️⃣' in opt:
+            ref_url = ref_url_box.value.strip()
+            if not ref_url:
+                print('⚠️  Please enter a reference video URL')
+                return
+            print(f'⬇️  Downloading reference video: {ref_url}')
+            ydl_opts = {
+                'outtmpl': '/content/pipeline/ref_video.%(ext)s',
+                'format': 'bestaudio/best',
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav'}],
+                'quiet': True
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([ref_url])
+            ref_audio = '/content/pipeline/ref_video.wav'
+            if not os.path.exists(ref_audio):
+                # Try mp4 fallback
+                for f_ in os.listdir('/content/pipeline'):
+                    if f_.startswith('ref_video'):
+                        subprocess.run(['ffmpeg', '-y', '-i', f'/content/pipeline/{f_}',
+                                        '-ar', '44100', ref_audio],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print('   Segmenting reference audio by speaker order...')
+            ref_full = AudioSegment.from_wav(ref_audio)
+            chunk_size_ms = max(10000, len(ref_full) // NUM_SPEAKERS)
+            for spk in range(1, NUM_SPEAKERS + 1):
+                start_ms = (spk - 1) * chunk_size_ms
+                end_ms   = min(start_ms + 15000, len(ref_full))
+                chunk    = ref_full[start_ms:end_ms]
+                path     = os.path.join(REF_VOICES_DIR, f'ref_speaker_{spk}_refvid.wav')
+                chunk.export(path, format='wav')
+                REFERENCE_VOICES[spk] = path
+                print(f'  ✅ Speaker {spk}: {path}')
+
+        elif '3️⃣' in opt or '4️⃣' in opt:
+            missing = [spk for spk in range(1, NUM_SPEAKERS + 1) if spk not in REFERENCE_VOICES]
+            if missing:
+                print(f'⚠️  Missing voice files for speakers: {missing}')
+                print('   Please upload files for all speakers above, then click Confirm again.')
+                return
+
+        print(f'\n✅ Voice references ready for {len(REFERENCE_VOICES)} speaker(s)!')
+        for spk, path in REFERENCE_VOICES.items():
+            dur = len(AudioSegment.from_wav(path)) / 1000
+            print(f'   Speaker {spk}: {path} ({dur:.1f}s)')
+
+confirm_btn.on_click(on_confirm)
+display(voice_option, ref_url_box, speaker_upload_area, confirm_btn, voice_status)
