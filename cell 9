@@ -1,0 +1,91 @@
+# ============================================================
+# CELL 9 — Compose Final Dubbed Video
+# ============================================================
+import subprocess, os
+from pydub import AudioSegment
+from IPython.display import Video, display
+from google.colab import files as colab_files
+
+assert os.path.exists(VIDEO_PATH),        '❌ VIDEO_PATH not set — run Cell 3'
+assert os.path.exists(SYNCED_AUDIO_PATH), '❌ Synced audio not found — run Cell 8'
+
+FINAL_VIDEO_PATH = '/content/pipeline/final_dubbed_video.mp4'
+
+print('🎬 Composing final dubbed video...')
+print(f'   Video : {VIDEO_PATH}')
+print(f'   Audio : {SYNCED_AUDIO_PATH}')
+
+# Get video duration
+probe = subprocess.run(
+    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+     '-of', 'default=noprint_wrappers=1:nokey=1', VIDEO_PATH],
+    capture_output=True, text=True
+)
+video_dur = float(probe.stdout.strip())
+print(f'   Video duration : {video_dur:.1f}s')
+
+# Pad or trim TTS audio to match video duration exactly
+tts_audio  = AudioSegment.from_wav(SYNCED_AUDIO_PATH)
+target_ms  = int(video_dur * 1000)
+if len(tts_audio) < target_ms:
+    tts_audio += AudioSegment.silent(target_ms - len(tts_audio), frame_rate=24000)
+else:
+    tts_audio = tts_audio[:target_ms]
+
+padded_path = '/content/pipeline/final_audio_padded.wav'
+tts_audio.export(padded_path, format='wav', parameters=['-ar', '24000'])
+print(f'   TTS duration   : {len(tts_audio)/1000:.1f}s')
+
+# Mux video + audio
+cmd = [
+    'ffmpeg', '-y',
+    '-i', VIDEO_PATH,
+    '-i', padded_path,
+    '-map', '0:v',
+    '-map', '1:a',
+    '-c:v', 'copy',
+    '-c:a', 'aac',
+    '-b:a', '320k',
+    '-ar', '24000',
+    '-af', 'aresample=resampler=soxr,loudnorm=I=-16:TP=-1.5:LRA=11',
+    '-shortest',
+    '-avoid_negative_ts', 'make_zero',
+    FINAL_VIDEO_PATH
+]
+result = subprocess.run(cmd, capture_output=True, text=True)
+
+if result.returncode != 0:
+    print('❌ FFmpeg error:')
+    print(result.stderr[-1000:])
+else:
+    size_mb = os.path.getsize(FINAL_VIDEO_PATH) / 1024 / 1024
+    print(f'\n✅ Final video: {FINAL_VIDEO_PATH} ({size_mb:.1f} MB)')
+
+    # Verify audio track
+    audio_probe = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+         '-show_entries', 'stream=codec_name,channels,sample_rate',
+         '-of', 'default=noprint_wrappers=1', FINAL_VIDEO_PATH],
+        capture_output=True, text=True
+    )
+    print(f'   Audio track : {audio_probe.stdout.strip()}')
+
+    # Preview
+    print('\n▶️  Generating 60s preview...')
+    preview_path = '/content/pipeline/preview_60s.mp4'
+    subprocess.run(
+        ['ffmpeg', '-y', '-i', FINAL_VIDEO_PATH, '-t', '60', '-c', 'copy', preview_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    display(Video(preview_path, embed=True, width=640))
+
+    # Download
+    print('\n⬇️  Downloading final video...')
+    colab_files.download(FINAL_VIDEO_PATH)
+    print('⬇️  Downloading English SRT...')
+    colab_files.download('/content/pipeline/subtitles_english.srt')
+
+print('\n🎉 Pipeline complete!')
+print('   final_dubbed_video.mp4')
+print('   subtitles_english.srt')
+print('   synced_english_audio.wav')
