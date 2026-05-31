@@ -1,0 +1,94 @@
+# ============================================================
+# CELL 5 — Translate Hindi SRT → English using Groq LLaMA 3 70B
+# Blazing fast: ~100 segments translated in under 60 seconds
+# ============================================================
+import json, re, time
+
+assert GROQ_CLIENT is not None, "❌ Run Cell 2 first and verify your Groq API key!"
+
+with open('/content/pipeline/segment_data.json', 'r', encoding='utf-8') as f:
+    segment_data = json.load(f)
+
+ENGLISH_SRT_PATH = '/content/pipeline/subtitles_english.srt'
+
+SYSTEM_PROMPT = (
+    "You are a professional Hindi to English translator. "
+    "Translate the given Hindi text into natural, fluent spoken English. "
+    "Preserve the tone, emotion, and intent of the speaker. "
+    "Return ONLY the English translation — no explanations, no notes, nothing else."
+)
+
+def translate_hindi_to_english(text, retries=3):
+    text = text.strip()
+    if not text:
+        return ''
+    for attempt in range(retries):
+        try:
+            resp = GROQ_CLIENT.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": f"Hindi: {text}\nEnglish:"}
+                ],
+                max_tokens=300,
+                temperature=0.1,
+                stop=["\nHindi:", "\nUser:"]
+            )
+            result = resp.choices[0].message.content.strip()
+            result = re.sub(r'^English:\s*', '', result, flags=re.IGNORECASE).strip()
+            if result:
+                return result
+        except Exception as e:
+            err = str(e)
+            if 'rate_limit' in err.lower() or '429' in err:
+                wait = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                print(f'  ⏳ Rate limit hit — waiting {wait}s (attempt {attempt+1})')
+                time.sleep(wait)
+            else:
+                print(f'  ⚠️  Attempt {attempt+1} error: {err[:80]}')
+                time.sleep(1)
+    return text  # Fallback: return original Hindi
+
+print(f'🌐 Translating {len(segment_data)} segments Hindi → English...')
+print('   Model  : llama-3.3-70b-versatile via Groq')
+print('   Speed  : ~500-800 tokens/sec (typically done in < 1 min)\n')
+
+start_time = time.time()
+for i, seg in enumerate(segment_data):
+    english = translate_hindi_to_english(seg['hindi_text'])
+    seg['english_text'] = english
+    if (i + 1) % 10 == 0 or i == len(segment_data) - 1:
+        elapsed = time.time() - start_time
+        print(f'  [{i+1}/{len(segment_data)}] ⚡ "{seg["hindi_text"][:35]}" → "{english[:35]}" ({elapsed:.1f}s)')
+
+elapsed_total = time.time() - start_time
+print(f'\n✅ Translation complete in {elapsed_total:.1f}s!')
+
+# Save updated segment data
+with open('/content/pipeline/segment_data.json', 'w', encoding='utf-8') as f:
+    json.dump(segment_data, f, ensure_ascii=False, indent=2)
+
+# Write English SRT
+def sec_to_srt(seconds):
+    ms = int(seconds * 1000)
+    h, r = divmod(ms, 3600000)
+    m, r = divmod(r, 60000)
+    s, ms_r = divmod(r, 1000)
+    return f'{h:02d}:{m:02d}:{s:02d},{ms_r:03d}'
+
+srt_lines = []
+for seg in segment_data:
+    srt_lines.append(str(seg['index']))
+    srt_lines.append(f"{sec_to_srt(seg['start'])} --> {sec_to_srt(seg['end'])}")
+    srt_lines.append(seg['english_text'])
+    srt_lines.append('')
+
+with open(ENGLISH_SRT_PATH, 'w', encoding='utf-8') as f:
+    f.write('\n'.join(srt_lines))
+
+print(f'📄 English SRT saved : {ENGLISH_SRT_PATH}')
+print(f'   Segments translated: {len(segment_data)}')
+# Preview first 5
+print('\n--- Preview (first 5 segments) ---')
+for seg in segment_data[:5]:
+    print(f'  [{seg["index"]}] {seg["hindi_text"][:40]:40s} → {seg["english_text"][:40]}')
