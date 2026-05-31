@@ -1,0 +1,60 @@
+=========================DOWNLOAD ALL FILE=========================
+download all file 
+                 01_install_dependencies
+                 02_groq_api_key
+                 03_load_video
+                 04_extract_audio_transcribe_diarize
+                 05_translate_to_english
+                 06_select_voice_cloning_source
+                 07_generate_tts_audio
+                 08_sync_tts_to_srt
+                 09_compose_dubbed_video
+
+=========================PASTE THE FILE IN GOOGLE COLAB=========================                 
+paste each file in different cell with respect to thier number 
+                                                              
+Cell 1                01_install_dependencies
+Cell 2                02_groq_api_key
+Cell 3                03_load_video
+Cell 4                04_extract_audio_transcribe_diarize
+Cell 5                05_translate_to_english
+Cell 6                06_select_voice_cloning_source
+Cell 7                07_generate_tts_audio
+Cell 8                08_sync_tts_to_srt
+Cell 9                09_compose_dubbed_video
+
+=========================CHANGE SETTING=========================
+in google Colab
+
+change runtime 
+              runtime -> change runtime type -> T4 gpu -> save
+
+star the file
+             on top of the file near notebook name there was a star 
+             after finding star then click on it to star the file
+
+give name to the notebook
+                        this will not impact on program but it sometime reduce youtube bot error problem
+
+=========================YOUTUBE BOT ERROR=========================
+
+if youtube bot error come while inputing youtube vedio url then 
+                            
+runtime -> disconnet and delete runtime
+
+this will solve the bot error if again bot error come then do this again (the error will mostly go in first  attempt)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
