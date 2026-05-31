@@ -1,0 +1,200 @@
+# ============================================================
+# CELL 3 — Video Input (URL or File Upload)  [FIXED v4]
+# ============================================================
+import os, subprocess, sys
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+
+print("🔧 Installing dependencies...")
+subprocess.run([sys.executable, "-m", "pip", "install", "-U", "yt-dlp", "pytubefix", "-q"])
+# Install yt-dlp with deno for JS runtime support
+subprocess.run("curl -fsSL https://deno.land/install.sh | sh", shell=True,
+               capture_output=True)
+DENO_PATH = os.path.expanduser("~/.deno/bin/deno")
+print("✅ Dependencies ready")
+
+import yt_dlp
+
+os.makedirs('/content/pipeline', exist_ok=True)
+os.makedirs('/content/pipeline/audio_chunks', exist_ok=True)
+os.makedirs('/content/pipeline/reference_voices', exist_ok=True)
+os.makedirs('/content/pipeline/tts_output', exist_ok=True)
+
+VIDEO_PATH = None
+
+# ── Helper: clean old downloads ──────────────────────────────
+def clean_old():
+    for f in os.listdir('/content/pipeline'):
+        if f.startswith('input_video'):
+            os.remove(f'/content/pipeline/{f}')
+
+def find_downloaded():
+    for f in os.listdir('/content/pipeline'):
+        if f.startswith('input_video') and (f.endswith('.mp4') or f.endswith('.webm') or f.endswith('.mkv')):
+            return f'/content/pipeline/{f}'
+    return None
+
+# ── Method 1: yt-dlp + deno JS runtime ──────────────────────
+def try_ytdlp_deno(url):
+    cmd = [
+        "yt-dlp",
+        "--js-runtimes", f"deno:{DENO_PATH}",
+        "--extractor-args", "youtube:player_client=web",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "-o", "/content/pipeline/input_video.%(ext)s",
+        url
+    ]
+    result = subprocess.run(cmd, capture_output=False)
+    if result.returncode == 0:
+        return find_downloaded()
+    return None
+
+# ── Method 2: yt-dlp mweb client ────────────────────────────
+def try_ytdlp_mweb(url):
+    ydl_opts = {
+        'outtmpl': '/content/pipeline/input_video.%(ext)s',
+        'format': 'best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'extractor_args': {'youtube': {'player_client': ['mweb']}},
+        'quiet': False,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return find_downloaded()
+
+# ── Method 3: yt-dlp ios client ─────────────────────────────
+def try_ytdlp_ios(url):
+    ydl_opts = {
+        'outtmpl': '/content/pipeline/input_video.%(ext)s',
+        'format': 'best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'extractor_args': {'youtube': {'player_client': ['ios']}},
+        'quiet': False,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return find_downloaded()
+
+# ── Method 4: pytubefix with visitor_data (no interactive prompt) ──
+def try_pytubefix_silent(url):
+    from pytubefix import YouTube
+    # use_oauth=False, use_po_token=False → tries without any token
+    yt = YouTube(url, use_oauth=False)
+    stream = (
+        yt.streams.filter(progressive=True, file_extension='mp4')
+                  .order_by('resolution').last()
+        or yt.streams.get_highest_resolution()
+    )
+    out = stream.download(output_path='/content/pipeline', filename='input_video.mp4')
+    return out if os.path.exists(out) else None
+
+# ── Method 5: yt-dlp via subprocess with --no-check-certificate ──
+def try_ytdlp_nocert(url):
+    cmd = [
+        "yt-dlp",
+        "--no-check-certificate",
+        "--user-agent", "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36",
+        "--add-header", "Accept-Language:en-US,en;q=0.9",
+        "--extractor-args", "youtube:player_client=android_vr",
+        "-f", "best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "-o", "/content/pipeline/input_video.%(ext)s",
+        url
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        return find_downloaded()
+    return None
+
+# ── UI ───────────────────────────────────────────────────────
+title      = widgets.HTML('<h3>🎬 Step 1: Load Your Hindi Video</h3>')
+input_mode = widgets.RadioButtons(
+    options=['🔗 Enter Video URL (YouTube / direct link)', '📁 Upload from File Explorer'],
+    description='Input:',
+    layout=widgets.Layout(width='500px')
+)
+url_box = widgets.Text(
+    placeholder='https://www.youtube.com/watch?v=...',
+    layout=widgets.Layout(width='500px')
+)
+load_btn   = widgets.Button(description='Load Video', button_style='primary', icon='download')
+status_out = widgets.Output()
+
+def on_mode_change(change):
+    url_box.layout.display = 'flex' if 'URL' in change['new'] else 'none'
+
+input_mode.observe(on_mode_change, names='value')
+
+def on_load(b):
+    global VIDEO_PATH
+    with status_out:
+        clear_output()
+
+        if 'URL' in input_mode.value:
+            url = url_box.value.strip()
+            if not url:
+                print('⚠️  Please enter a URL')
+                return
+
+            print(f'⬇️  Downloading: {url}\n')
+            clean_old()
+
+            attempts = [
+                ('yt-dlp › deno JS runtime + web client', try_ytdlp_deno),
+                ('yt-dlp › mweb client',                  try_ytdlp_mweb),
+                ('yt-dlp › ios client',                   try_ytdlp_ios),
+                ('yt-dlp › android_vr + custom UA',       try_ytdlp_nocert),
+                ('pytubefix › no token',                  try_pytubefix_silent),
+            ]
+
+            for label, fn in attempts:
+                try:
+                    print(f'── 🔄 {label} ──')
+                    VIDEO_PATH = fn(url)
+                    if VIDEO_PATH and os.path.exists(VIDEO_PATH):
+                        size_mb = os.path.getsize(VIDEO_PATH) / 1024 / 1024
+                        print(f'\n✅ Downloaded via: {label}')
+                        print(f'   Path : {VIDEO_PATH}  |  Size: {size_mb:.1f} MB')
+                        return
+                    else:
+                        print(f'   ⚠️  No file produced\n')
+                except Exception as e:
+                    short_err = str(e).split('\n')[0][:120]
+                    print(f'   ❌ Failed: {short_err}\n')
+
+            # ── All methods failed: show clear instructions ──
+            print('=' * 55)
+            print('❌ YouTube is blocking all automated downloads.')
+            print('=' * 55)
+            print("""
+👉 QUICKEST WORKAROUND (2 minutes):
+
+  1. On your LOCAL machine, open terminal and run:
+       pip install yt-dlp
+       yt-dlp -f best -o video.mp4 "YOUR_URL"
+
+  2. Then switch to "Upload from File Explorer" above
+     and upload the downloaded video.mp4
+
+OR use any online downloader site (e.g. ssyoutube.com)
+to download the Short, then upload it here.
+""")
+
+        else:
+            from google.colab import files
+            print('📁 Opening file picker...')
+            uploaded = files.upload()
+            if uploaded:
+                fname = list(uploaded.keys())[0]
+                dest  = f'/content/pipeline/{fname}'
+                with open(dest, 'wb') as f:
+                    f.write(uploaded[fname])
+                VIDEO_PATH = dest
+                size_mb = os.path.getsize(VIDEO_PATH) / 1024 / 1024
+                print(f'✅ Uploaded: {VIDEO_PATH} ({size_mb:.1f} MB)')
+            else:
+                print('❌ No file selected')
+
+load_btn.on_click(on_load)
+display(title, input_mode, url_box, load_btn, status_out)
