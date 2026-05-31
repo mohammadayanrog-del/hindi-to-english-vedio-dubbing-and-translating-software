@@ -1,0 +1,131 @@
+# ============================================================
+# CELL 7 — Generate English TTS Audio per Segment using F5-TTS
+# ============================================================
+import os, json, subprocess, gc
+from pydub import AudioSegment
+
+assert REFERENCE_VOICES, '❌ Run Cell 6 first!'
+
+with open('/content/pipeline/segment_data.json', 'r', encoding='utf-8') as f:
+    segment_data = json.load(f)
+
+TTS_DIR = '/content/pipeline/tts_output'
+os.makedirs(TTS_DIR, exist_ok=True)
+
+# ── Auto-clean silent/corrupt files from previous runs ───────
+print('🧹 Cleaning silent files from previous runs...')
+cleaned = 0
+if os.path.exists(TTS_DIR):
+    for f in os.listdir(TTS_DIR):
+        if not f.endswith('.wav'):
+            continue
+        path = os.path.join(TTS_DIR, f)
+        try:
+            audio = AudioSegment.from_wav(path)
+            if audio.rms < 50 or len(audio) < 100:
+                os.remove(path)
+                cleaned += 1
+        except Exception:
+            os.remove(path)
+            cleaned += 1
+print(f'  Removed {cleaned} bad files\n')
+
+
+def run_f5tts(ref_audio, ref_text, gen_text, output_path):
+    gen_text = gen_text.strip()
+    if not gen_text:
+        raise ValueError('gen_text is empty')
+
+    ref_text_short = ref_text.strip()[:200]
+
+    cmd = [
+        'f5-tts_infer-cli',
+        '--model',       'F5TTS_v1_Base',
+        '--ref_audio',   ref_audio,
+        '--ref_text',    ref_text_short,
+        '--gen_text',    gen_text,
+        '--output_dir',  os.path.dirname(output_path),
+        '--output_file', os.path.basename(output_path),
+        '--speed',       '1.0',
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'F5-TTS failed: {result.stderr[-800:]}')
+
+    if not os.path.exists(output_path):
+        out_dir   = os.path.dirname(output_path)
+        wav_files = sorted([f for f in os.listdir(out_dir) if f.endswith('.wav')])
+        if wav_files:
+            os.rename(os.path.join(out_dir, wav_files[-1]), output_path)
+        else:
+            raise FileNotFoundError(f'Output WAV not found: {output_path}')
+
+
+def get_ref_text_for_speaker(speaker_id):
+    segs = [s for s in segment_data if s['speaker'] == speaker_id]
+    segs_sorted = sorted(segs, key=lambda x: x['duration'], reverse=True)
+    if segs_sorted:
+        text = segs_sorted[0].get('english_text') or segs_sorted[0].get('hindi_text') or 'Hello'
+        return text.strip()[:200]
+    return 'Hello, this is a sample reference.'
+
+
+print(f'🎙️  Generating TTS for {len(segment_data)} segments...')
+failed_segments = []
+success_count   = 0
+
+for i, seg in enumerate(segment_data):
+    speaker_id   = seg['speaker']
+    english_text = seg.get('english_text', '').strip()
+
+    if not english_text:
+        print(f'  ⚠️  Seg {seg["index"]}: empty text — skipping')
+        continue
+
+    ref_audio = REFERENCE_VOICES.get(speaker_id) or REFERENCE_VOICES.get(list(REFERENCE_VOICES.keys())[0])
+    ref_text  = get_ref_text_for_speaker(speaker_id)
+    out_wav   = os.path.join(TTS_DIR, f"tts_{seg['index']:04d}.wav")
+
+    # Resume support — skip only if file is valid and not silent
+    if os.path.exists(out_wav):
+        try:
+            existing = AudioSegment.from_wav(out_wav)
+            if existing.rms > 50 and len(existing) > 100:
+                print(f'  ⏭️  Seg {seg["index"]} already exists — skipping')
+                success_count += 1
+                continue
+            else:
+                os.remove(out_wav)  # remove silent/corrupt file
+        except Exception:
+            os.remove(out_wav)
+
+    try:
+        run_f5tts(ref_audio, ref_text, english_text, out_wav)
+
+        # Verify generated file is not silent
+        generated = AudioSegment.from_wav(out_wav)
+        if generated.rms < 50:
+            raise RuntimeError('Generated audio is silent')
+
+        success_count += 1
+        print(f'  [{i+1}/{len(segment_data)}] ✅ Seg {seg["index"]} (Spk {speaker_id}) '
+              f'rms={generated.rms}: "{english_text[:50]}"')
+
+    except Exception as e:
+        print(f'  [{i+1}/{len(segment_data)}] ❌ Seg {seg["index"]} failed: {e}')
+        failed_segments.append(seg['index'])
+        duration_ms = int(seg.get('duration', 1.0) * 1000)
+        silence = AudioSegment.silent(duration=duration_ms, frame_rate=24000)
+        silence.export(out_wav, format='wav')
+
+    # Free memory every 10 segments
+    if i % 10 == 0:
+        gc.collect()
+
+print(f'\n✅ TTS generation complete!')
+print(f'   Successful : {success_count}/{len(segment_data)}')
+if failed_segments:
+    print(f'   ⚠️  Failed  : {failed_segments}')
+else:
+    print(f'   🎉 No failures!')
